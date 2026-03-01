@@ -36,7 +36,7 @@ def parse_duration(duration_str):
         minutes = float(parts[1])
         seconds = float(parts[2])
         return hours * 3600 + minutes * 60 + seconds
-    except:
+    except (AttributeError, IndexError, ValueError, TypeError):
         return 0
 
 def get_audio_bitrate_kbps(input_path):
@@ -60,8 +60,21 @@ def get_audio_bitrate_kbps(input_path):
         if not raw.isdigit():
             return None
         return max(1, int(round(int(raw) / 1000)))
-    except:
+    except (subprocess.CalledProcessError, OSError, ValueError):
         return None
+
+def has_ffmpeg_encoder(encoder_name):
+    """检查 ffmpeg 是否支持指定编码器"""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return encoder_name in result.stdout
+    except (subprocess.CalledProcessError, OSError):
+        return False
 
 def run_ffmpeg_with_progress(cmd):
     """运行 FFmpeg 并显示进度"""
@@ -110,7 +123,7 @@ def run_ffmpeg_with_progress(cmd):
 
 def get_user_input():
     """
-    使用 macOS 原生对话框获取用户输入的源文件夹、CRF 和编码格式
+    使用 macOS 原生对话框获取用户输入的源文件夹、质量参数、编码格式、位深和编码模式
     """
     print("正在打开文件夹选择窗口...")
     
@@ -121,7 +134,7 @@ def get_user_input():
     
     if not source_dir:
         print("❌ 用户取消或未选择文件夹，程序退出。")
-        return None, None, None
+        return None, None, None, None, None
 
     # 2. 选择编码格式
     codec_script = 'button returned of (display dialog "请选择视频编码格式:\n\nH.264: 兼容性最好，几乎所有设备支持\nH.265: 压缩率更高，文件更小" buttons {"H.264", "H.265"} default button "H.265" with title "编码格式选择")'
@@ -129,52 +142,107 @@ def get_user_input():
     
     if not codec_choice:
         print("❌ 用户取消或未选择编码格式，程序退出。")
-        return None, None, None
-    
-    # 3. 获取 CRF
-    quality_script = 'text returned of (display dialog "请输入 CRF (0-51，推荐 18-30)" default answer "23" buttons {"OK"} default button "OK" with title "视频质量设置")'
+        return None, None, None, None, None
+
+    # 3. 选择编码模式
+    mode_script = 'button returned of (display dialog "请选择编码模式:\n\n软件编码: 质量控制更精细，速度较慢\n硬件加速(VideoToolbox): 速度更快，更省电（质量控制较粗）" buttons {"软件编码", "硬件加速"} default button "硬件加速" with title "编码模式选择")'
+    mode_choice = run_applescript(mode_script)
+
+    if not mode_choice:
+        print("❌ 用户取消或未选择编码模式，程序退出。")
+        return None, None, None, None, None
+
+    # 4. 选择位深
+    bit_depth_script = 'button returned of (display dialog "请选择输出位深:\n\n8-bit: 兼容性最好，默认推荐\n10-bit: 色彩过渡更平滑，压缩效率通常更好（兼容性较低）" buttons {"8-bit", "10-bit"} default button "8-bit" with title "位深选择")'
+    bit_depth_choice = run_applescript(bit_depth_script)
+
+    if not bit_depth_choice:
+        print("❌ 用户取消或未选择位深，程序退出。")
+        return None, None, None, None, None
+
+    # H.264 的 VideoToolbox 不支持 10-bit，提前拦截
+    if mode_choice == "硬件加速" and codec_choice == "H.264" and bit_depth_choice == "10-bit":
+        print("❌ H.264 硬件加速不支持 10-bit。请改用 H.265 或 8-bit。")
+        return None, None, None, None, None
+
+    # 5. 获取质量参数
+    if mode_choice == "软件编码":
+        quality_script = 'text returned of (display dialog "请输入 CRF (0-51，推荐 18-30)" default answer "23" buttons {"OK"} default button "OK" with title "视频质量设置")'
+    else:
+        quality_script = 'text returned of (display dialog "请输入硬件编码质量值 q:v (1-100，推荐 65，越大越清晰)" default answer "65" buttons {"OK"} default button "OK" with title "视频质量设置")'
     quality = run_applescript(quality_script)
     
     if not quality:
         print("❌ 用户取消或未输入质量，程序退出。")
-        return None, None, None
+        return None, None, None, None, None
 
-    # 验证 CRF 输入是否为数字
-    if not quality.isdigit() or not (0 <= int(quality) <= 51):
+    # 验证输入范围
+    if not quality.isdigit():
+        print(f"❌ 输入的质量值 '{quality}' 无效，请输入数字。")
+        return None, None, None, None, None
+    quality_value = int(quality)
+    if mode_choice == "软件编码" and not (0 <= quality_value <= 51):
         print(f"❌ 输入的 CRF '{quality}' 无效，请输入 0-51 之间的数字。")
-        return None, None, None
+        return None, None, None, None, None
+    if mode_choice == "硬件加速" and not (1 <= quality_value <= 100):
+        print(f"❌ 输入的 q:v '{quality}' 无效，请输入 1-100 之间的数字。")
+        return None, None, None, None, None
 
-    return source_dir, quality, codec_choice
+    return source_dir, quality, codec_choice, bit_depth_choice, mode_choice
 
-def compress_videos(source_dir, quality, codec_choice):
+def compress_videos(source_dir, quality, codec_choice, bit_depth_choice, mode_choice):
     # 检查 FFmpeg 是否安装
     if shutil.which("ffmpeg") is None:
         print("错误：未检测到 FFmpeg。请先安装 FFmpeg (brew install ffmpeg)")
         return
+
+    # 规范化路径，避免 source_dir 带尾斜杠时 basename 为空
+    source_dir = os.path.normpath(source_dir)
 
     # 自动生成输出文件夹路径：在源文件夹旁边创建一个 _compressed 后缀的文件夹
     parent_dir = os.path.dirname(source_dir)
     folder_name = os.path.basename(source_dir)
     target_dir = os.path.join(parent_dir, f"{folder_name}_compressed")
 
-    # 根据用户选择设置编码参数（CRF 仅适用于软件编码器）
+    # 根据用户选择设置编码参数
     if codec_choice == "H.264":
-        video_codec = 'libx264'
         video_tag = 'avc1'
-        codec_name = 'H.264 (Software, CRF)'
+        if mode_choice == "硬件加速":
+            video_codec = 'h264_videotoolbox'
+            codec_name = 'H.264 (VideoToolbox)'
+        else:
+            video_codec = 'libx264'
+            codec_name = 'H.264 (Software, CRF)'
     else:  # H.265
-        video_codec = 'libx265'
         video_tag = 'hvc1'
-        codec_name = 'H.265 (Software, CRF)'
+        if mode_choice == "硬件加速":
+            video_codec = 'hevc_videotoolbox'
+            codec_name = 'H.265 (VideoToolbox)'
+        else:
+            video_codec = 'libx265'
+            codec_name = 'H.265 (Software, CRF)'
+
+    if not has_ffmpeg_encoder(video_codec):
+        print(f"错误：当前 FFmpeg 不支持编码器 '{video_codec}'。")
+        print("请安装支持该编码器的 FFmpeg，或切换为软件编码。")
+        return
+
+    is_10bit = bit_depth_choice == "10-bit"
+    pix_fmt = 'yuv420p10le' if is_10bit else 'yuv420p'
+    bit_depth_name = "10-bit" if is_10bit else "8-bit"
+    quality_label = "CRF" if mode_choice == "软件编码" else "q:v"
 
     print(f"🚀 开始扫描目录: {source_dir}")
     print(f"📂 目标保存目录: {target_dir}")
+    print(f"⚙️ 编码模式: {mode_choice}")
     print(f"🎬 视频编码格式: {codec_name}")
-    print(f"🎨 视频质量设置 (CRF): {quality}")
+    print(f"🧩 输出位深: {bit_depth_name}")
+    print(f"🎨 视频质量设置 ({quality_label}): {quality}")
     print("-" * 50)
     
     # 统计信息
     stats = {
+        'discovered_videos': 0,      # 发现的视频总数
         'total_videos': 0,           # 处理的视频总数
         'compressed_videos': 0,      # 实际压缩的视频数
         'copied_videos': 0,          # 复制原文件的视频数（压缩后变大）
@@ -208,6 +276,7 @@ def compress_videos(source_dir, quality, codec_choice):
             
             if file_ext in VIDEO_EXTENSIONS:
                 # 处理视频文件：转码
+                stats['discovered_videos'] += 1
                 
                 # 构建输出文件名 (统一改为 .mp4 以获得最佳兼容性)
                 output_filename = os.path.splitext(file)[0] + ".mp4"
@@ -232,22 +301,29 @@ def compress_videos(source_dir, quality, codec_choice):
                 temp_output_path = output_path + ".temp.mp4"
 
                 # FFmpeg 命令 (输出到临时文件)
-                # 针对 AMD 显卡优化的参数
+                # 软件编码参数
                 cmd = [
                     'ffmpeg',
                     '-i', input_path,
                     '-c:v', video_codec,            # 使用用户选择的编码器
                     '-tag:v', video_tag,            # 对应的视频标签 (avc1 for H.264, hvc1 for H.265)
-                    '-pix_fmt', 'yuv420p',          # 兼容 macOS 预览
-                    '-crf', quality,                # CRF 画质参数
+                    '-pix_fmt', pix_fmt,            # 8-bit/10-bit 输出
                     '-c:a', 'aac',                  # 音频编码
                     '-b:a', f'{target_audio_kbps}k',# 音频码率（上下限限制）
                     '-movflags', '+faststart',      # 将 moov 头移到文件前部，提升兼容性
-                    '-y',                           # 覆盖确认
-                    temp_output_path
+                    '-y'                            # 覆盖确认
                 ]
-                
-                # 如果是 libx264 编码器，添加针对多核 CPU 的优化参数
+
+                if mode_choice == "软件编码":
+                    cmd.extend(['-crf', quality])   # 软件编码使用 CRF
+                    # H.264 10-bit 需要明确 high10 profile 以避免协商到 8-bit
+                    if video_codec == 'libx264' and is_10bit:
+                        cmd.extend(['-profile:v', 'high10'])
+
+                elif mode_choice == "硬件加速":
+                    cmd.extend(['-q:v', quality])   # VideoToolbox 使用 q:v
+
+                # 软件编码的性能参数
                 if video_codec == 'libx264':
                     cmd.extend([
                         '-preset', 'medium',        # 编码预设 (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)
@@ -259,6 +335,9 @@ def compress_videos(source_dir, quality, codec_choice):
                         '-preset', 'medium',        # 编码预设
                         '-threads', '0'             # 自动选择线程数
                     ])
+
+                # 输出文件路径放在最后，确保前面的输出参数生效
+                cmd.append(temp_output_path)
 
                 try:
                     run_ffmpeg_with_progress(cmd)
@@ -323,7 +402,7 @@ def compress_videos(source_dir, quality, codec_choice):
     print("=" * 50)
     
     # 视频统计
-    total_video_operations = stats['total_videos'] + stats['skipped_videos']
+    total_video_operations = stats['discovered_videos']
     if total_video_operations > 0:
         print(f"\n🎬 视频文件:")
         print(f"   总共发现: {total_video_operations} 个")
@@ -374,6 +453,6 @@ def compress_videos(source_dir, quality, codec_choice):
     print("\n" + "=" * 50)
 
 if __name__ == "__main__":
-    source_dir, quality, codec_choice = get_user_input()
-    if source_dir and quality and codec_choice:
-        compress_videos(source_dir, quality, codec_choice)
+    source_dir, quality, codec_choice, bit_depth_choice, mode_choice = get_user_input()
+    if source_dir and quality and codec_choice and bit_depth_choice and mode_choice:
+        compress_videos(source_dir, quality, codec_choice, bit_depth_choice, mode_choice)
